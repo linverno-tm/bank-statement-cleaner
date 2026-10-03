@@ -29,7 +29,6 @@ import tempfile
 import threading
 import traceback
 import urllib.request
-import winreg
 from collections import defaultdict
 from copy import copy
 from decimal import Decimal
@@ -39,15 +38,29 @@ from openpyxl.cell.cell import MergedCell
 from openpyxl.styles import Alignment, Border, Font, Side
 from openpyxl.utils import get_column_letter
 
-import tkinter as tk
-from tkinter import font as tkfont
-from tkinter import ttk, filedialog, messagebox
+try:
+    import winreg
+except ImportError:            # Windows emas (sayt serveri) - Excel qidirilmaydi
+    winreg = None
 
-import sv_ttk
+# Oyna kutubxonalari faqat desktop ilovaga kerak. Sayt (bank ko'chirmasini
+# brauzerda soddalashtirish) core.py ning faqat hisob qismini ishlatadi va
+# serverda tkinter bo'lmasligi mumkin.
+try:
+    import tkinter as tk
+    from tkinter import font as tkfont
+    from tkinter import ttk, filedialog, messagebox
+
+    import sv_ttk
+except ImportError:
+    class _NoTk:
+        Tk = Toplevel = object
+    tk = _NoTk()
+    tkfont = ttk = filedialog = messagebox = sv_ttk = None
 
 # Ilovaning joriy versiyasi. Launcher .exe o'zgarmaydi, shuning uchun
 # foydalanuvchi ko'radigan versiya aynan shu fayldan olinadi.
-CORE_VERSION = "2.2.2"
+CORE_VERSION = "2.2.3"
 
 # Kodni qaysi shoxobchadan olganini launcher.py exec() dan oldin shu
 # nom bilan uzatadi. To'g'ridan-to'g'ri `python core.py` bilan ishga
@@ -303,7 +316,13 @@ def _data_dir():
     yuklab olinsa, yillar davomida to'plangan lug'at eski papkada qolib
     ketardi va ilova hammasini unutgandek bo'lardi. %LOCALAPPDATA%
     esa .exe qayerda turishidan qat'i nazar o'zgarmaydi — kesh,
-    kalit va branch.txt ham o'sha yerda."""
+    kalit va branch.txt ham o'sha yerda.
+
+    SODDA_DATA_DIR - sayt o'z papkasini beradi (desktop ilovada yo'q)."""
+    sayt = os.environ.get("SODDA_DATA_DIR")
+    if sayt:
+        os.makedirs(sayt, exist_ok=True)
+        return sayt
     lokal = os.environ.get("LOCALAPPDATA")
     if not lokal:
         return _base_dir()
@@ -809,6 +828,135 @@ _XLS_CONVERT_PS = (
 )
 
 
+_HTML_TOKEN = re.compile(r"<!--.*?-->|<(/?)([a-zA-Z][a-zA-Z0-9]*)([^>]*)>|([^<]+)", re.S)
+_HTML_ENTITIES = {"nbsp": " ", "amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'", "laquo": "«", "raquo": "»"}
+_HTML_ENTITY = re.compile(r"&(#x[0-9a-fA-F]+|#\d+|[a-zA-Z]+);")
+_INT_RX = re.compile(r"^-?\d{1,15}$")
+_MONEY_RX = re.compile(r"^-?\d{1,3}(?:[ \u00a0]\d{3})*(?:[.,]\d+)?$|^-?\d+[.,]\d+$")
+
+
+def _html_unescape(t):
+    def one(m):
+        k = m.group(1)
+        try:
+            if k.startswith("#x"):
+                return chr(int(k[2:], 16))
+            if k.startswith("#"):
+                return chr(int(k[1:]))
+        except (ValueError, OverflowError):
+            return m.group(0)
+        return _HTML_ENTITIES.get(k.lower(), m.group(0))
+    return _HTML_ENTITY.sub(one, t)
+
+
+def _html_cell_value(text, as_text):
+    """Katak qiymati - Excel HTML ni ochgandagidek: class="txt" matn bo'lib
+    qoladi (hisob raqam, MFO "00083"), qolgan son ko'rinishidagilar son."""
+    t = _html_unescape(text).replace("\u00a0", " ")
+    t = "\n".join(" ".join(line.split()) for line in t.split("\n")).strip()
+    if not t:
+        return None
+    if as_text:
+        return t
+    if _INT_RX.match(t):
+        return int(t)
+    if _MONEY_RX.match(t):
+        try:
+            return float(t.replace(" ", "").replace("\u00a0", "").replace(",", "."))
+        except ValueError:
+            pass
+    return t
+
+
+def html_table_rows(raw):
+    """HTML jadval(lar)ini qatorlarga ajratadi. Bank fayli yopilmagan
+    <td>/<th> teglarini ham ishlatadi (<th>Счет<th>ИНН) - yangi katak
+    oldingisini yopadi. html.parser ishlatilmaydi: u .exe ichida yo'q."""
+    head = raw[:4096].decode("ascii", "ignore").lower()
+    m = re.search(r"charset=[\"']?([\w-]+)", head)
+    encs = ([m.group(1)] if m else []) + ["utf-8", "cp1251"]
+    text = None
+    for enc in encs:
+        try:
+            text = raw.decode(enc)
+            break
+        except (LookupError, UnicodeDecodeError):
+            continue
+    if text is None:
+        text = raw.decode("cp1251", "replace")
+
+    rows, row, cell = [], None, None
+    skip = 0
+
+    def close_cell():
+        nonlocal cell
+        if cell is not None and row is not None:
+            row.append(_html_cell_value("".join(cell["t"]), cell["txt"]))
+            row.extend([None] * (cell["span"] - 1))
+        cell = None
+
+    def close_row():
+        nonlocal row
+        close_cell()
+        if row is not None and any(v is not None for v in row):
+            rows.append(row)
+        row = None
+
+    for mt in _HTML_TOKEN.finditer(text):
+        end, tag, attrs, data = mt.group(1), (mt.group(2) or "").lower(), mt.group(3) or "", mt.group(4)
+        if data is not None:
+            if cell is not None and not skip:
+                cell["t"].append(data.replace("\r", "").replace("\n", " "))
+            continue
+        if tag in ("script", "style", "head", "title"):
+            skip = max(0, skip - 1) if end else skip + 1
+        elif skip:
+            continue
+        elif tag == "tr":
+            close_row()
+            if not end:
+                row = []
+        elif tag in ("td", "th"):
+            close_cell()
+            if not end:
+                if row is None:
+                    row = []
+                sp = re.search(r"colspan\s*=\s*[\"']?(\d+)", attrs, re.I)
+                cell = {"t": [], "span": max(1, min(int(sp.group(1)), 50)) if sp else 1,
+                        "txt": bool(re.search(r"class\s*=\s*[\"']?[^>]*\btxt\b", attrs, re.I))}
+        elif tag == "br" and cell is not None:
+            cell["t"].append("\n")
+        elif tag in ("table", "tbody", "thead") and end:
+            close_row()
+    close_row()
+    return rows
+
+
+def _html_to_xlsx(path):
+    """HTML ni (bank ".xls" deb beradigan) .xlsx ga o'giradi - Excel'siz."""
+    with open(path, "rb") as f:
+        rows = html_table_rows(f.read())
+    if not rows:
+        raise ValueError("Fayl ichida jadval topilmadi.")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    for r in rows:
+        ws.append(r)
+    ish = tempfile.mkdtemp(prefix="soddahisobot_")
+    chiqish = os.path.join(ish, os.path.splitext(os.path.basename(path))[0] + ".xlsx")
+    wb.save(chiqish)
+    return chiqish
+
+
+def _is_html_file(path):
+    try:
+        with open(path, "rb") as f:
+            bosh = f.read(1024).lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    except OSError:
+        return False
+    return bosh.startswith(b"<") and (b"<html" in bosh or b"<table" in bosh or b"<!doctype" in bosh)
+
+
 def ensure_xlsx(path):
     """Eski .xls fayl bo'lsa, uni vaqtinchalik .xlsx ga o'giradi.
 
@@ -820,7 +968,13 @@ def ensure_xlsx(path):
     qaytadan tarqatish kerak bo'lardi. Excel esa bu kompyuterlarda
     allaqachon bor — hisobot baribir unda ochiladi.
 
+    Bank (IABS/Client-Bank) ko'pincha ".xls" nomli HTML beradi - uni
+    Excel'siz, o'zimiz o'qiymiz: boshliq kompyuterida Excel o'girishi
+    ishlamay, fayl "tanilmay" qolardi (2.2.3).
+
     Qaytaradi: o'qish uchun yo'l. .xlsx bo'lsa — o'zgarishsiz."""
+    if _is_html_file(path):
+        return _html_to_xlsx(path)
     if not path.lower().endswith(".xls"):
         return path
 
@@ -1273,6 +1427,8 @@ def find_excel_exe():
     bypassing whatever program .xlsx happens to be (mis)associated with on
     this machine (a common support issue: someone once chose "Open with ->
     Notepad -> always use this app" for .xlsx files)."""
+    if winreg is None:
+        return None
     candidates = [
         (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\EXCEL.EXE"),
         (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\EXCEL.EXE"),
