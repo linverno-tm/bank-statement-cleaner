@@ -940,6 +940,9 @@ def _html_to_xlsx(path):
         raise ValueError("Fayl ichida jadval topilmadi.")
     wb = openpyxl.Workbook()
     ws = wb.active
+    # Varaq nomi - Excel o'girgandagidek fayl nomi (natijada 2-varaq shu nomda)
+    nom = re.sub(r"[\\/*?:\[\]]", "", os.path.splitext(os.path.basename(path))[0]).strip("' ")[:31]
+    ws.title = nom or "Sheet1"
     for r in rows:
         ws.append(r)
     ish = tempfile.mkdtemp(prefix="soddahisobot_")
